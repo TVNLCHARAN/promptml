@@ -30,29 +30,54 @@ graph_builder = StateGraph(State)
 def safe_invoke(prompt):
     response = llm.invoke(prompt)
     match = re.search(r'\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}', response.content, re.DOTALL)
-    # print(match.group())
     if match:
         try:
             json_data = json.loads(match.group())
-            print(json_data)
             return json_data
         except json.JSONDecodeError:
-            print("Error: LLM response is not valid JSON")
             return {}
     else:
-        print("Error: LLM response is empty")
         return {}
 
+from playwright.sync_api import sync_playwright
+import json
 
 def extract_dom(state: State):
+    """
+    Extracts the full DOM content, including iframe content and scripts, using CDP.
+    """
     url = "https://prompt.ml/0"
+    
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return {"dom_content": response.content}
-    except requests.RequestException as e:
-        print(f"Error fetching URL: {e}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+            
+            page.goto(url)
+
+            main_dom_content = page.content()
+
+            iframe_doms = []
+            iframes = page.query_selector_all('iframe')
+            for iframe in iframes:
+                try:
+                    iframe_content = iframe.content_frame().content()
+                    iframe_doms.append(iframe_content)
+                except:
+                    iframe_doms.append("")
+            dom_content = {
+                "main_page": main_dom_content,
+                "iframes": iframe_doms
+            }
+
+            browser.close()
+            # print(dom_content)
+            return {"dom_content": json.dumps(dom_content)}
+    except Exception as e:
+        print(f"Error extracting DOM: {e}")
         return {"dom_content": ""}
+
 
 graph_builder.add_node("extract_dom", extract_dom)
 
@@ -63,9 +88,9 @@ def find_risky_elements(state: State):
     
     prompt = f"""
     Extract a JSON structure listing potential XSS vulnerabilities from the following HTML:
+    - Look for instances of `parent.postMessage('message', ...)` without origin validation
     - Identify input fields, textareas, script elements, and event handlers
-    - Locate `innerHTML`, `document.write`, `eval`, and `postMessage` without origin validation
-    - Return only JSON formatted as: {{"elements": [{{"tag": "<tag>", "location": "<description>"}}]}}, don't generate even a single extra word instead of json
+    - Return JSON in the format: {{"elements": [{{"tag": "<tag>", "location": "<description>"}}]}}
     {dom_content}
     """
     
@@ -75,33 +100,43 @@ def find_risky_elements(state: State):
         risky_elements = risky_elements.get("elements", [])
         return {"risky_elements": risky_elements}
     except json.JSONDecodeError:
-        print("Error: LLM response is not valid JSON")
         return {"risky_elements": []}
 
 graph_builder.add_node("find_risky_elements", find_risky_elements)
 
 def generate_payloads(state: State):
     risky_elements = state["risky_elements"]
+    dom_content = state["dom_content"]
+
     if not risky_elements:
         return {"payloads": {"payloads": []}}
     
     prompt = f"""
-    Generate payloads in a way that they are passed to the js function mentioned in the source-code, such that prompt(1) will be executed after returned from the function.
-    Generate JavaScript XSS payloads as JSON for these elements:
+    Generate JavaScript XSS payloads for the following elements:
+    - Analyse the escape function carefully, on how the input should be inorder to return a runnable payload.
+    - The DOM content is provided below.
+    - The risky elements are identified below.
+
+    Use both the full DOM content and the risky elements to craft the payloads.
+    
+    Main DOM Content:
+    {dom_content}
+    
+    Risky Elements:
     {risky_elements}
 
-    - Ensure the payloads trigger `prompt(1)`
-    - Use appropriate encoding based on the tag type
-    - Format: {{"payloads": [{{"tag": "<tag>", "payload": "<script>"}}]}}
+    - Analyze the function `escape(input)` and find ways the payload can bypass validation and be rendered.
+    - Ensure payloads execute `prompt(1)` on successful exploitation.
+    - Pay special attention to quotation marks and HTML encoding formats to bypass regular expressions.
+    - Return the payloads in the format: {{"payloads": [{{"tag": "<tag>", "payload": "<script>"}}]}}
     """
     
     payloads = safe_invoke(prompt)
     
     if isinstance(payloads, dict):
         return {"payloads": payloads.get("payloads", [])}
-
-    print("Error: LLM response is not a valid dictionary")
     return {"payloads": {"payloads": []}}
+
 
 graph_builder.add_node("generate_payloads", generate_payloads)
 
@@ -136,7 +171,6 @@ def execute_payloads(state: State):
 
             browser.close()
     except Exception as e:
-        print(f"Playwright Error: {e}")
         return {"exploit_results": []}
 
     return {"exploit_results": exploit_results}
@@ -153,6 +187,6 @@ graph = graph_builder.compile()
 
 initial_state = {"dom_content": "", "risky_elements": [], "payloads": {}, "exploit_results": []}
 
+
 for event in graph.stream(initial_state):
-    # print(event.values())
     pass

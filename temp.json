@@ -1,0 +1,8 @@
+{
+  "elements": [
+    { "tag": "input", "location": "id=name" },
+    { "tag": "textarea", "location": "id=input" },
+    { "tag": "script", "location": "id=unsafe-script" },
+    { "tag": "pre", "location": "id=injected-html" }
+  ]
+}
